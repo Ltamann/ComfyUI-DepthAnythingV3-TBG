@@ -632,14 +632,537 @@ resizing back to original dimensions. Useful when you want to preserve the exact
             return out
 
 
+class DepthAnythingV3_AdvancedTBG:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "da3_model": ("DA3MODEL",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "camera_params": ("CAMERA_PARAMS",),
+                "resize_method": (["resize", "crop", "pad"], {"default": "resize"}),
+                "invert_depth": ("BOOLEAN", {"default": False}),
+                "keep_model_size": ("BOOLEAN", {"default": False}),
+                "normalize_depth": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "IMAGE", "STRING", "STRING", "MASK", "IMAGE")
+    RETURN_NAMES = ("depth", "confidence", "ray_origin", "ray_direction", "extrinsics", "intrinsics", "sky_mask", "content_mask")
+    FUNCTION = "process"
+    CATEGORY = "DepthAnythingV3"
+    DESCRIPTION = """
+Advanced Depth Anything V3 node with custom TBG features:
+- normalize_depth: Toggle normalization on/off (default: True)
+- sky_mask: Original mask (1=sky/white, 0=content/black)
+- content_mask: Inverted depth masked by sky (content=inverted depth, sky=black)
+
+All other outputs same as DepthAnythingV3_Advanced.
+    """
+
+    def process(self, da3_model, images, camera_params=None, resize_method="resize", invert_depth=False, keep_model_size=False, normalize_depth=True):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        model = da3_model['model']
+        dtype = da3_model['dtype']
+        config = da3_model['config']
+
+        # Check model capabilities
+        capabilities = check_model_capabilities(model)
+        if not capabilities["has_sky_segmentation"]:
+            logger.warning(
+                "WARNING: This model does not support sky segmentation. "
+                "Sky/content masks will be zeros. Use Mono/Metric/Nested models for sky segmentation."
+            )
+
+        B, H, W, C = images.shape
+
+        # Convert from ComfyUI format [B, H, W, C] to PyTorch [B, C, H, W]
+        images_pt = images.permute(0, 3, 1, 2)
+
+        # Resize to patch size multiple
+        images_pt, orig_H, orig_W = resize_to_patch_multiple(images_pt, DEFAULT_PATCH_SIZE, resize_method)
+
+        # Normalize with ImageNet stats
+        normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        normalized_images = normalize(images_pt)
+
+        # Prepare for model: add view dimension [B, N, 3, H, W] where N=1
+        normalized_images = normalized_images.unsqueeze(1)
+
+        # Prepare camera parameters if provided
+        extrinsics_input = None
+        intrinsics_input = None
+
+        if camera_params is not None:
+            if capabilities["has_camera_conditioning"]:
+                extrinsics_input = camera_params["extrinsics"].to(device).to(dtype)
+                intrinsics_input = camera_params["intrinsics"].to(device).to(dtype)
+                if extrinsics_input.shape[0] == 1 and B > 1:
+                    extrinsics_input = extrinsics_input.expand(B, -1, -1, -1)
+                    intrinsics_input = intrinsics_input.expand(B, -1, -1, -1)
+                logger.info("Using camera-conditioned depth estimation")
+            else:
+                logger.warning("Model does not support camera conditioning. Camera params ignored.")
+
+        pbar = ProgressBar(B)
+        depth_out = []
+        depth_inverted_out = []  # Store inverted depth separately
+        conf_out = []
+        sky_out = []
+        ray_origin_out = []
+        ray_dir_out = []
+        extrinsics_list = []
+        intrinsics_list = []
+
+        # Move model to device if not already there
+        safe_model_to_device(model, device)
+
+        autocast_condition = (dtype != torch.float32) and not mm.is_device_mps(device)
+
+        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+            for i in range(B):
+                img = normalized_images[i:i + 1].to(device)
+
+                # Get camera params for this batch item
+                ext_i = extrinsics_input[i:i + 1] if extrinsics_input is not None else None
+                int_i = intrinsics_input[i:i + 1] if intrinsics_input is not None else None
+
+                # Run model forward with optional camera conditioning
+                output = model(img, extrinsics=ext_i, intrinsics=int_i)
+
+                # Extract depth
+                depth = None
+                if hasattr(output, 'depth'):
+                    depth = output.depth
+                elif isinstance(output, dict) and 'depth' in output:
+                    depth = output['depth']
+
+                if depth is None or not torch.is_tensor(depth):
+                    raise ValueError("Model output does not contain valid depth tensor")
+
+                # Extract confidence
+                conf = None
+                if hasattr(output, 'depth_conf'):
+                    conf = output.depth_conf
+                elif isinstance(output, dict) and 'depth_conf' in output:
+                    conf = output['depth_conf']
+
+                # Verify it's a tensor, otherwise create uniform confidence
+                if conf is None or not torch.is_tensor(conf):
+                    conf = torch.ones_like(depth)
+
+                # Extract sky mask (if available - only for Mono/Metric models)
+                sky = None
+                if hasattr(output, 'sky'):
+                    sky = output.sky
+                elif isinstance(output, dict) and 'sky' in output:
+                    sky = output['sky']
+
+                if sky is None or not torch.is_tensor(sky):
+                    # Create dummy sky mask (all zeros = no sky) for non-supported models
+                    sky = torch.zeros_like(depth)
+                else:
+                    # Normalize sky mask to 0-1 range
+                    sky_min, sky_max = sky.min(), sky.max()
+                    if sky_max > sky_min:
+                        sky = (sky - sky_min) / (sky_max - sky_min)
+
+                # Store original depth for inversion
+                depth_original = depth.clone()
+
+                # Apply normalization conditionally based on normalize_depth parameter
+                if normalize_depth:
+                    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8)
+                    depth_original_normalized = depth.clone()
+                else:
+                    depth_original_normalized = depth.clone()
+
+                # Create inverted depth for content_mask (always normalized for masking)
+                depth_inv = (depth_original - depth_original.min()) / (depth_original.max() - depth_original.min() + 1e-8)
+                depth_inv = 1.0 - depth_inv
+
+                # Apply inversion if requested (for main depth output)
+                if invert_depth:
+                    if normalize_depth:
+                        depth = 1.0 - depth
+                    else:
+                        # For raw metric depth, invert as max - depth
+                        depth = depth.max() - depth
+
+                # Normalize confidence
+                conf_range = conf.max() - conf.min()
+                if conf_range > 1e-8:
+                    conf = (conf - conf.min()) / conf_range
+                else:
+                    # Uniform confidence - keep as 1.0 (high confidence)
+                    conf = torch.ones_like(conf)
+
+                depth_out.append(depth.cpu())
+                depth_inverted_out.append(depth_inv.cpu())
+                conf_out.append(conf.cpu())
+                sky_out.append(sky.cpu())
+
+                # Extract ray maps (if available)
+                ray = None
+                if hasattr(output, 'ray'):
+                    ray = output.ray
+                elif isinstance(output, dict) and 'ray' in output:
+                    ray = output['ray']
+
+                if ray is not None and torch.is_tensor(ray):
+                    # ray shape: [B, S, 6, H, W] - first 3 channels are origin, last 3 are direction
+                    ray = ray.squeeze(0)  # Remove batch dimension: [S, 6, H, W]
+                    ray = ray.squeeze(0)  # Remove view dimension: [6, H, W]
+                    ray_origin = ray[:3]  # [3, H, W]
+                    ray_dir = ray[3:6]  # [3, H, W]
+
+                    ray_origin_out.append(ray_origin.cpu())
+                    ray_dir_out.append(ray_dir.cpu())
+                else:
+                    # Create dummy ray maps if not available
+                    ray_origin_out.append(torch.zeros(3, depth.shape[-2], depth.shape[-1]))
+                    ray_dir_out.append(torch.zeros(3, depth.shape[-2], depth.shape[-1]))
+
+                # Extract camera parameters (if available)
+                extr = None
+                if hasattr(output, 'extrinsics'):
+                    extr = output.extrinsics
+                elif isinstance(output, dict) and 'extrinsics' in output:
+                    extr = output['extrinsics']
+
+                if extr is not None and torch.is_tensor(extr):
+                    extrinsics_list.append(extr.cpu())
+                else:
+                    extrinsics_list.append(None)
+
+                intr = None
+                if hasattr(output, 'intrinsics'):
+                    intr = output.intrinsics
+                elif isinstance(output, dict) and 'intrinsics' in output:
+                    intr = output['intrinsics']
+
+                if intr is not None and torch.is_tensor(intr):
+                    intrinsics_list.append(intr.cpu())
+                else:
+                    intrinsics_list.append(None)
+
+                pbar.update(1)
+
+        model.to(offload_device)
+        mm.soft_empty_cache()
+
+        # Process outputs
+        depth_final = process_tensor_to_image(depth_out, orig_H, orig_W, normalize_output=normalize_depth, skip_resize=keep_model_size)
+        conf_final = process_tensor_to_image(conf_out, orig_H, orig_W, normalize_output=True, skip_resize=keep_model_size)
+        sky_final = process_tensor_to_mask(sky_out, orig_H, orig_W, skip_resize=keep_model_size)
+
+        # Process inverted depth to IMAGE format
+        depth_inv_final = process_tensor_to_image(depth_inverted_out, orig_H, orig_W, normalize_output=True, skip_resize=keep_model_size)
+
+        # Create content_mask: where sky_mask is black (0), show inverted depth; where sky is not black (1), paint black
+        # sky_final is [B, H, W] (MASK format)
+        # depth_inv_final is [B, H, W, C] (IMAGE format)
+
+        # Convert sky_mask to IMAGE format for masking [B, H, W] -> [B, H, W, 1]
+        sky_expanded = sky_final.unsqueeze(-1)  # [B, H, W, 1]
+
+        # Create content_mask: multiply inverted depth by (1 - sky_mask)
+        # Where sky=0 (content): (1-0)=1, so inverted_depth * 1 = inverted_depth
+        # Where sky=1 (sky): (1-1)=0, so inverted_depth * 0 = black (0)
+        content_final = depth_inv_final * (1.0 - sky_expanded)
+
+        ray_origin_final = self._process_ray_to_image(ray_origin_out, orig_H, orig_W, normalize=True, skip_resize=keep_model_size)
+        ray_dir_final = self._process_ray_to_image(ray_dir_out, orig_H, orig_W, normalize=True, skip_resize=keep_model_size)
+
+        # Format camera parameters as strings
+        extrinsics_str = format_camera_params(extrinsics_list, "extrinsics")
+        intrinsics_str = format_camera_params(intrinsics_list, "intrinsics")
+
+        return (depth_final, conf_final, ray_origin_final, ray_dir_final, extrinsics_str, intrinsics_str, sky_final, content_final)
+
+    def _process_ray_to_image(self, ray_list, orig_H, orig_W, normalize=True, skip_resize=False):
+        """Convert list of ray tensors to ComfyUI IMAGE format."""
+        # Concatenate all ray tensors
+        out = torch.cat([r.unsqueeze(0) for r in ray_list], dim=0)  # [B, 3, H, W]
+
+        if normalize:
+            # Normalize each batch independently for visualization
+            for i in range(out.shape[0]):
+                ray_batch = out[i]  # [3, H, W]
+                ray_min = ray_batch.min()
+                ray_max = ray_batch.max()
+                if ray_max > ray_min:
+                    out[i] = (ray_batch - ray_min) / (ray_max - ray_min)
+                else:
+                    out[i] = torch.zeros_like(ray_batch)
+
+        # Convert to ComfyUI format [B, H, W, 3]
+        out = out.permute(0, 2, 3, 1).float()  # [B, H, W, 3]
+
+        # Resize back to original dimensions unless skip_resize is True
+        if not skip_resize:
+            final_H = (orig_H // 2) * 2
+            final_W = (orig_W // 2) * 2
+            if out.shape[1] != final_H or out.shape[2] != final_W:
+                out = F.interpolate(
+                    out.permute(0, 3, 1, 2),
+                    size=(final_H, final_W),
+                    mode="bilinear"
+                ).permute(0, 2, 3, 1)
+
+        if normalize:
+            return torch.clamp(out, 0, 1)
+        else:
+            return out
+
+
+class DepthAnythingTBGV3_V2Style:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "da3_model": ("DA3MODEL",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "camera_params": ("CAMERA_PARAMS",),
+                "resize_method": (["resize", "crop", "pad"], {"default": "resize"}),
+                "keep_model_size": ("BOOLEAN", {"default": False}),
+                "contrast_boost": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 3.0, "step": 0.1}),
+                "sky_blur_radius": ("INT", {"default": 3, "min": 0, "max": 21, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("depth_v2style", "confidence", "sky_mask")
+    FUNCTION = "process"
+    CATEGORY = "TBG/DepthAnythingV3"
+    DESCRIPTION = """
+Depth Anything V3 with V2-style output:
+- Converts depth to disparity (1/depth) so sky is BLACK like V2
+- Applies contrast boost for stronger depth gradations (default: 1.5x)
+- Uses subtle edge softening to avoid hard sky cutoffs
+- sky_blur_radius: 0=no blur, 3=subtle (default), 5-7=moderate, 10+=strong
+
+Recommended: Use Mono or Metric models with sky segmentation.
+    """
+
+    def _gaussian_blur(self, tensor, kernel_size):
+        """Apply Gaussian blur to a tensor [B, C, H, W]."""
+        if kernel_size <= 0:
+            return tensor
+
+        # Ensure kernel size is odd
+        kernel_size = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+
+        # Use tighter sigma for more subtle blur
+        sigma = kernel_size / 3.0  # Changed from /6.0 to /3.0 for less spread
+        kernel_range = torch.arange(kernel_size, dtype=tensor.dtype, device=tensor.device) - kernel_size // 2
+        gaussian_1d = torch.exp(-0.5 * (kernel_range / sigma) ** 2)
+        gaussian_1d = gaussian_1d / gaussian_1d.sum()
+
+        # Create 2D kernel from 1D
+        kernel_2d = gaussian_1d.unsqueeze(0) * gaussian_1d.unsqueeze(1)
+        kernel_2d = kernel_2d / kernel_2d.sum()
+
+        # Reshape for conv2d: [out_channels, in_channels, H, W]
+        kernel_2d = kernel_2d.view(1, 1, kernel_size, kernel_size)
+        kernel_2d = kernel_2d.repeat(tensor.shape[1], 1, 1, 1)
+
+        # Apply padding to maintain size
+        padding = kernel_size // 2
+
+        # Apply convolution (depthwise)
+        blurred = F.conv2d(tensor, kernel_2d, padding=padding, groups=tensor.shape[1])
+
+        return blurred
+
+    def process(self, da3_model, images, camera_params=None, resize_method="resize", keep_model_size=False, contrast_boost=1.5, sky_blur_radius=3):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        model = da3_model['model']
+        dtype = da3_model['dtype']
+        config = da3_model['config']
+
+        # Check model capabilities
+        capabilities = check_model_capabilities(model)
+        if not capabilities["has_sky_segmentation"]:
+            logger.warning(
+                "WARNING: This model does not support sky segmentation. "
+                "Output will not have soft sky blending. Use Mono/Metric/Nested models for best V2-style results."
+            )
+
+        B, H, W, C = images.shape
+
+        # Convert from ComfyUI format [B, H, W, C] to PyTorch [B, C, H, W]
+        images_pt = images.permute(0, 3, 1, 2)
+
+        # Resize to patch size multiple
+        images_pt, orig_H, orig_W = resize_to_patch_multiple(images_pt, DEFAULT_PATCH_SIZE, resize_method)
+
+        # Normalize with ImageNet stats
+        normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        normalized_images = normalize(images_pt)
+
+        # Prepare for model: add view dimension [B, N, 3, H, W] where N=1
+        normalized_images = normalized_images.unsqueeze(1)
+
+        # Prepare camera parameters if provided
+        extrinsics_input = None
+        intrinsics_input = None
+
+        if camera_params is not None:
+            if capabilities["has_camera_conditioning"]:
+                extrinsics_input = camera_params["extrinsics"].to(device).to(dtype)
+                intrinsics_input = camera_params["intrinsics"].to(device).to(dtype)
+                if extrinsics_input.shape[0] == 1 and B > 1:
+                    extrinsics_input = extrinsics_input.expand(B, -1, -1, -1)
+                    intrinsics_input = intrinsics_input.expand(B, -1, -1, -1)
+                logger.info("Using camera-conditioned depth estimation")
+            else:
+                logger.warning("Model does not support camera conditioning. Camera params ignored.")
+
+        pbar = ProgressBar(B)
+        depth_out = []
+        conf_out = []
+        sky_out = []
+
+        # Move model to device if not already there
+        safe_model_to_device(model, device)
+
+        autocast_condition = (dtype != torch.float32) and not mm.is_device_mps(device)
+
+        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+            for i in range(B):
+                img = normalized_images[i:i + 1].to(device)
+
+                # Get camera params for this batch item
+                ext_i = extrinsics_input[i:i + 1] if extrinsics_input is not None else None
+                int_i = intrinsics_input[i:i + 1] if intrinsics_input is not None else None
+
+                # Run model forward with optional camera conditioning
+                output = model(img, extrinsics=ext_i, intrinsics=int_i)
+
+                # Extract depth
+                depth = None
+                if hasattr(output, 'depth'):
+                    depth = output.depth
+                elif isinstance(output, dict) and 'depth' in output:
+                    depth = output['depth']
+
+                if depth is None or not torch.is_tensor(depth):
+                    raise ValueError("Model output does not contain valid depth tensor")
+
+                # Extract confidence
+                conf = None
+                if hasattr(output, 'depth_conf'):
+                    conf = output.depth_conf
+                elif isinstance(output, dict) and 'depth_conf' in output:
+                    conf = output['depth_conf']
+
+                if conf is None or not torch.is_tensor(conf):
+                    conf = torch.ones_like(depth)
+
+                # Extract sky mask
+                sky = None
+                if hasattr(output, 'sky'):
+                    sky = output.sky
+                elif isinstance(output, dict) and 'sky' in output:
+                    sky = output['sky']
+
+                if sky is None or not torch.is_tensor(sky):
+                    sky = torch.zeros_like(depth)
+                else:
+                    # Normalize sky mask to 0-1 range
+                    sky_min, sky_max = sky.min(), sky.max()
+                    if sky_max > sky_min:
+                        sky = (sky - sky_min) / (sky_max - sky_min)
+
+                # ===== V2-STYLE PROCESSING WITH SUBTLE EDGE SOFTENING =====
+
+                # 1. Convert depth to disparity (inverse depth) like V2
+                epsilon = 1e-6
+                disparity = 1.0 / (depth + epsilon)
+
+                # 2. Normalize disparity to 0-1 range
+                disp_min = disparity.min()
+                disp_max = disparity.max()
+                disparity_norm = (disparity - disp_min) / (disp_max - disp_min + epsilon)
+
+                # 3. Apply contrast boost using power function
+                disparity_contrast = torch.pow(disparity_norm, 1.0 / contrast_boost)
+
+                # 4. Apply SUBTLE sky mask blending
+                if sky.max() > 0.1 and sky_blur_radius > 0:
+                    # Apply minimal Gaussian blur to sky mask for soft edges
+                    sky_for_blur = sky.squeeze(0) if sky.dim() == 4 else sky
+                    if sky_for_blur.dim() == 2:
+                        sky_for_blur = sky_for_blur.unsqueeze(0).unsqueeze(0)  # [1, 1, H, W]
+                    elif sky_for_blur.dim() == 3:
+                        sky_for_blur = sky_for_blur.unsqueeze(0)  # [1, C, H, W]
+
+                    # Apply subtle Gaussian blur
+                    sky_soft = self._gaussian_blur(sky_for_blur, sky_blur_radius)
+                    sky_soft = sky_soft.squeeze(0)  # Remove batch dim
+
+                    # Ensure same shape as disparity
+                    while sky_soft.dim() < disparity_contrast.dim():
+                        sky_soft = sky_soft.unsqueeze(0)
+                    while sky_soft.dim() > disparity_contrast.dim():
+                        sky_soft = sky_soft.squeeze(0)
+
+                    # Soft blending with minimal edge feathering
+                    disparity_final = disparity_contrast * (1.0 - sky_soft)
+                else:
+                    # No blur or no sky detected - use hard mask or no masking
+                    if sky.max() > 0.1:
+                        # Hard mask without blur
+                        sky_binary = (sky > 0.5).float()
+                        while sky_binary.dim() < disparity_contrast.dim():
+                            sky_binary = sky_binary.unsqueeze(0)
+                        disparity_final = disparity_contrast * (1.0 - sky_binary)
+                    else:
+                        disparity_final = disparity_contrast
+
+                # Normalize confidence
+                conf_range = conf.max() - conf.min()
+                if conf_range > 1e-8:
+                    conf = (conf - conf.min()) / conf_range
+                else:
+                    conf = torch.ones_like(conf)
+
+                depth_out.append(disparity_final.cpu())
+                conf_out.append(conf.cpu())
+                sky_out.append(sky.cpu())
+
+                pbar.update(1)
+
+        model.to(offload_device)
+        mm.soft_empty_cache()
+
+        # Process outputs
+        depth_final = process_tensor_to_image(depth_out, orig_H, orig_W, normalize_output=False, skip_resize=keep_model_size)
+        conf_final = process_tensor_to_image(conf_out, orig_H, orig_W, normalize_output=True, skip_resize=keep_model_size)
+        sky_final = process_tensor_to_mask(sky_out, orig_H, orig_W, skip_resize=keep_model_size)
+
+        return (depth_final, conf_final, sky_final)
+
+
 NODE_CLASS_MAPPINGS = {
     "DepthAnything_V3": DepthAnything_V3,
     "DepthAnythingV3_3D": DepthAnythingV3_3D,
     "DepthAnythingV3_Advanced": DepthAnythingV3_Advanced,
+    "DepthAnythingV3_AdvancedTBG": DepthAnythingV3_AdvancedTBG,  # by TBG
+    "DepthAnythingV3_TBGV2Style": DepthAnythingTBGV3_V2Style,  # by TBG
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "DepthAnything_V3": "Depth Anything V3",
     "DepthAnythingV3_3D": "Depth Anything V3 (3D/Raw)",
     "DepthAnythingV3_Advanced": "Depth Anything V3 (Advanced)",
+    "DepthAnythingV3_AdvancedTBG": "Depth Anything V3 (Advanced TBG)",  # by TBG
+    "DepthAnythingV3_V2Style": "Depth Anything V3 (TBG V2 Style)",   # by TBG
 }
