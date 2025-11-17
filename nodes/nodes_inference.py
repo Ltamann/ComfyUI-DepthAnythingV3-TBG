@@ -1156,7 +1156,7 @@ NODE_CLASS_MAPPINGS = {
     "DepthAnythingV3_3D": DepthAnythingV3_3D,
     "DepthAnythingV3_Advanced": DepthAnythingV3_Advanced,
     "DepthAnythingV3_AdvancedTBG": DepthAnythingV3_AdvancedTBG,  # by TBG
-    "DepthAnythingV3_TBGV2Style": DepthAnythingTBGV3_V2Style,  # by TBG
+    "DepthAnythingTBGV3_V2Style": DepthAnythingTBGV3_V2Style,  # by TBG
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1164,5 +1164,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DepthAnythingV3_3D": "Depth Anything V3 (3D/Raw)",
     "DepthAnythingV3_Advanced": "Depth Anything V3 (Advanced)",
     "DepthAnythingV3_AdvancedTBG": "Depth Anything V3 (Advanced TBG)",  # by TBG
-    "DepthAnythingV3_V2Style": "Depth Anything V3 (TBG V2 Style)",   # by TBG
+    "DepthAnythingTBGV3_V2Style": "Depth Anything V3 (TBG V2 Style)",   # by TBG
 }
