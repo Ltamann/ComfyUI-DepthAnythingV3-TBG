@@ -878,11 +878,447 @@ Produces clean depth maps with natural edge transitions matching V2.
         return (depth_final, conf_final, sky_final)
 
 
+class DepthAnythingV3_V2Style_Pure:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "da3_model": ("DA3MODEL",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "camera_params": ("CAMERA_PARAMS",),
+                "resize_method": (["resize", "crop", "pad"], {"default": "resize"}),
+                "keep_model_size": ("BOOLEAN", {"default": False}),
+                "contrast_boost": ("FLOAT", {"default": 2.0, "min": 0.5, "max": 3.0, "step": 0.1}),
+                "edge_smooth_radius": ("INT", {"default": 1, "min": 0, "max": 3, "step": 1}),
+                "sky_threshold": ("FLOAT", {"default": 0.3, "min": 0.0, "max": 0.5, "step": 0.01}),
+                "enable_far_depth_detection": ("BOOLEAN", {"default": True}),
+                "far_depth_percentile": ("FLOAT", {"default": 0.98, "min": 0.90, "max": 0.99, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "MASK")
+    RETURN_NAMES = ("depth_v2style", "confidence", "sky_mask", "far_depth_mask")
+    FUNCTION = "process"
+    CATEGORY = "DepthAnythingV3"
+    DESCRIPTION = """
+V2-style postprocessing for Depth Anything V3 with intelligent far-depth detection:
+- Automatically detects far elements (sky/horizon) from raw depth values
+- Combines sky mask with depth-based detection for robust horizon handling
+- Normalizes only content area using 1st–99th percentile for maximum contrast
+- enable_far_depth_detection: Auto-detect and blacken far regions (default: ON)
+- far_depth_percentile: Threshold for far depth (0.98 = top 2% depth values treated as sky)
+
+Solves precision loss and horizon artifacts automatically!
+"""
+
+    def _smooth_mask_edges(self, mask, radius):
+        if radius <= 0:
+            return mask
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(0)
+        kernel_size = radius * 2 + 1
+        kernel = torch.ones((1, 1, kernel_size, kernel_size), device=mask.device, dtype=mask.dtype) / (kernel_size ** 2)
+        mask_dilated = F.max_pool2d(mask, kernel_size=3, stride=1, padding=1)
+        mask_eroded = 1.0 - F.max_pool2d(1.0 - mask, kernel_size=3, stride=1, padding=1)
+        edge_zone = ((mask_dilated - mask_eroded).abs() > 0.01).float()
+        mask_smoothed = F.conv2d(mask, kernel, padding=radius)
+        result = mask * (1.0 - edge_zone) + mask_smoothed * edge_zone
+        return result
+
+    def _detect_far_depth_regions(self, depth, percentile_threshold=0.98):
+        """
+        Detect far depth regions that should be treated as background/sky.
+        This handles cases where sky mask is imperfect or horizon has precision issues.
+        """
+        # Calculate depth threshold based on percentile
+        depth_flat = depth.flatten()
+        threshold_value = torch.quantile(depth_flat, percentile_threshold)
+
+        # Create binary mask: pixels with depth >= threshold are considered "far"
+        far_mask = (depth >= threshold_value).float()
+
+        # Optional: morphological closing to fill small gaps
+        # This connects nearby far regions (e.g., horizon line)
+        if far_mask.sum() > 0:
+            far_mask_4d = far_mask.unsqueeze(0).unsqueeze(0) if far_mask.dim() == 2 else far_mask
+            if far_mask_4d.dim() == 3:
+                far_mask_4d = far_mask_4d.unsqueeze(0)
+
+            # Dilate then erode to close gaps (morphological closing)
+            kernel_size = 5
+            far_mask_dilated = F.max_pool2d(far_mask_4d, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            far_mask_closed = 1.0 - F.max_pool2d(1.0 - far_mask_dilated, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+
+            # Squeeze back to original dimensions
+            far_mask = far_mask_closed.squeeze()
+
+        return far_mask, threshold_value
+
+    def process(self, da3_model, images, camera_params=None, resize_method="resize", keep_model_size=False,
+                contrast_boost=2.0, edge_smooth_radius=1, sky_threshold=0.3,
+                enable_far_depth_detection=True, far_depth_percentile=0.98):
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        model = da3_model['model']
+        dtype = da3_model['dtype']
+        config = da3_model['config']
+        capabilities = check_model_capabilities(model)
+        B, H, W, C = images.shape
+        images_pt = images.permute(0, 3, 1, 2)
+        images_pt, orig_H, orig_W = resize_to_patch_multiple(images_pt, DEFAULT_PATCH_SIZE, resize_method)
+        normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        normalized_images = normalize(images_pt)
+        normalized_images = normalized_images.unsqueeze(1)
+
+        extrinsics_input = None
+        intrinsics_input = None
+        if camera_params is not None:
+            if capabilities["has_camera_conditioning"]:
+                extrinsics_input = camera_params["extrinsics"].to(device).to(dtype)
+                intrinsics_input = camera_params["intrinsics"].to(device).to(dtype)
+                if extrinsics_input.shape[0] == 1 and B > 1:
+                    extrinsics_input = extrinsics_input.expand(B, -1, -1, -1)
+                    intrinsics_input = intrinsics_input.expand(B, -1, -1, -1)
+
+        pbar = ProgressBar(B)
+        depth_out = []
+        conf_out = []
+        sky_out = []
+        far_depth_mask_out = []
+
+        safe_model_to_device(model, device)
+        autocast_condition = (dtype != torch.float32) and not mm.is_device_mps(device)
+
+        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+            for i in range(B):
+                img = normalized_images[i:i + 1].to(device)
+                ext_i = extrinsics_input[i:i + 1] if extrinsics_input is not None else None
+                int_i = intrinsics_input[i:i + 1] if intrinsics_input is not None else None
+                output = model(img, extrinsics=ext_i, intrinsics=int_i)
+
+                depth = getattr(output, 'depth', output.get('depth')) if isinstance(output, dict) or hasattr(output, 'depth') else None
+                conf = getattr(output, 'depth_conf', output.get('depth_conf')) if isinstance(output, dict) or hasattr(output, 'depth_conf') else None
+                if conf is None or not torch.is_tensor(conf):
+                    conf = torch.ones_like(depth)
+
+                sky = getattr(output, 'sky', output.get('sky')) if isinstance(output, dict) or hasattr(output, 'sky') else None
+                if sky is None or not torch.is_tensor(sky):
+                    sky = torch.zeros_like(depth)
+                else:
+                    sky_min, sky_max = sky.min(), sky.max()
+                    if sky_max > sky_min:
+                        sky = (sky - sky_min) / (sky_max - sky_min)
+
+                # ===== INTELLIGENT FAR DEPTH DETECTION =====
+                far_depth_mask = torch.zeros_like(depth)
+
+                if enable_far_depth_detection:
+                    # Detect far regions from raw depth values
+                    far_depth_mask, depth_threshold = self._detect_far_depth_regions(depth, far_depth_percentile)
+
+                    logger.info(f"Far depth detection: threshold={depth_threshold:.4f}, "
+                                f"far pixels={far_depth_mask.sum().item()}/{depth.numel()} "
+                                f"({100 * far_depth_mask.sum().item() / depth.numel():.2f}%)")
+
+                # Combine sky mask with far-depth detection
+                # Union: anything marked as sky OR detected as far depth
+                if sky.max() > 0.1 or enable_far_depth_detection:
+                    sky_mask_binary = (sky > sky_threshold).float() if sky.max() > 0.1 else torch.zeros_like(depth)
+
+                    # Ensure matching dimensions
+                    while far_depth_mask.dim() < sky_mask_binary.dim():
+                        far_depth_mask = far_depth_mask.unsqueeze(0)
+                    while sky_mask_binary.dim() < far_depth_mask.dim():
+                        sky_mask_binary = sky_mask_binary.unsqueeze(0)
+
+                    # Combine: pixels marked as sky OR far depth
+                    combined_sky_mask = torch.maximum(sky_mask_binary, far_depth_mask)
+
+                    # Content mask is inverse
+                    content_mask_binary = 1.0 - combined_sky_mask
+
+                    logger.info(f"Combined mask: sky={sky_mask_binary.sum().item()}, "
+                                f"far={far_depth_mask.sum().item()}, "
+                                f"total_sky={combined_sky_mask.sum().item()}")
+                else:
+                    content_mask_binary = torch.ones_like(depth)
+
+                # Smooth mask for final blending
+                content_mask_smooth = self._smooth_mask_edges(content_mask_binary, edge_smooth_radius) if edge_smooth_radius > 0 else content_mask_binary
+
+                # Ensure correct dimensions
+                while content_mask_binary.dim() < depth.dim():
+                    content_mask_binary = content_mask_binary.unsqueeze(0)
+                while content_mask_smooth.dim() < depth.dim():
+                    content_mask_smooth = content_mask_smooth.unsqueeze(0)
+
+                # ===== DISPARITY CONVERSION WITH CONTENT-ONLY NORMALIZATION =====
+                disparity = 1.0 / (depth + 1e-6)
+                disparity_masked = disparity * content_mask_binary
+                content_pixels = disparity_masked[content_mask_binary > 0.5]
+
+                if content_pixels.numel() > 100:
+                    # Percentile-based normalization to avoid outliers
+                    if content_pixels.numel() > 1000:
+                        sorted_pixels = torch.sort(content_pixels.flatten())[0]
+                        p1 = max(1, int(sorted_pixels.numel() * 0.01))
+                        p99 = min(sorted_pixels.numel() - 1, int(sorted_pixels.numel() * 0.99))
+                        disp_min, disp_max = sorted_pixels[p1], sorted_pixels[p99]
+
+                        logger.info(f"Content disparity range: min={disp_min:.6f}, max={disp_max:.6f}, "
+                                    f"range={disp_max - disp_min:.6f}")
+                    else:
+                        disp_min, disp_max = content_pixels.min(), content_pixels.max()
+
+                    disparity_norm = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+                    disparity_norm = torch.clamp(disparity_norm, 0.0, 1.0)
+                else:
+                    # Fallback: full range
+                    disp_min, disp_max = disparity.min(), disparity.max()
+                    disparity_norm = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+
+                # Contrast boost
+                disparity_contrast = torch.pow(disparity_norm, 1.0 / contrast_boost)
+
+                # Apply smooth mask to set sky/far regions to black
+                depth_final = disparity_contrast * content_mask_smooth
+
+                # Normalize confidence
+                conf_range = conf.max() - conf.min()
+                conf = (conf - conf.min()) / conf_range if conf_range > 1e-8 else torch.ones_like(conf)
+
+                depth_out.append(depth_final.cpu())
+                conf_out.append(conf.cpu())
+                sky_out.append(sky.cpu())
+                far_depth_mask_out.append(far_depth_mask.cpu())
+
+                pbar.update(1)
+
+        model.to(offload_device)
+        mm.soft_empty_cache()
+
+        depth_final = process_tensor_to_image(depth_out, orig_H, orig_W, normalize_output=False, skip_resize=keep_model_size)
+        conf_final = process_tensor_to_image(conf_out, orig_H, orig_W, normalize_output=True, skip_resize=keep_model_size)
+        sky_final = process_tensor_to_mask(sky_out, orig_H, orig_W, skip_resize=keep_model_size)
+        far_depth_final = process_tensor_to_mask(far_depth_mask_out, orig_H, orig_W, skip_resize=keep_model_size)
+
+        return (depth_final, conf_final, sky_final, far_depth_final)
+
+
+import torch
+import torch.nn.functional as F
+from torchvision import transforms
+from contextlib import nullcontext
+import comfy.model_management as mm
+from comfy.utils import ProgressBar
+from .utils import (IMAGENET_MEAN, IMAGENET_STD, DEFAULT_PATCH_SIZE,
+                           process_tensor_to_image, process_tensor_to_mask,
+                           resize_to_patch_multiple, safe_model_to_device,
+                           check_model_capabilities, logger)
+import numpy as np
+from scipy.ndimage import distance_transform_edt
+
+class DepthAnythingV3_V2Style_AdaptiveHorizon:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "da3_model": ("DA3MODEL",),
+                "images": ("IMAGE",),
+            },
+            "optional": {
+                "camera_params": ("CAMERA_PARAMS",),
+                "resize_method": (["resize", "crop", "pad"], {"default": "resize"}),
+                "keep_model_size": ("BOOLEAN", {"default": False}),
+                "contrast_boost": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 3.0, "step": 0.1}),
+                "sky_threshold": ("FLOAT", {"default": 0.25, "min": 0.15, "max": 0.4, "step": 0.01}),
+                "fade_band_width": ("INT", {"default": 4, "min": 2, "max": 8, "step": 1}),
+                "enable_far_depth_detection": ("BOOLEAN", {"default": True}),
+                "far_depth_percentile": ("FLOAT", {"default": 0.98, "min": 0.90, "max": 0.99, "step": 0.01}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK")
+    RETURN_NAMES = ("depth_v2style", "confidence", "sky_mask")
+    FUNCTION = "process"
+    CATEGORY = "DepthAnythingV3"
+    DESCRIPTION = """
+Robust V2-style postprocessing Depth Anything V3 node with adaptive horizon fading and far depth detection.
+Soft cosine alpha blending for horizon transition for smoother visuals.
+"""
+
+    @staticmethod
+    def _ensure_4d(x):
+        if x.numel() == 0:
+            raise ValueError(f"Empty tensor with shape {x.shape} cannot be processed")
+        if x.dim() == 2:
+            return x.unsqueeze(0).unsqueeze(0)
+        elif x.dim() == 3:
+            return x.unsqueeze(1)
+        elif x.dim() == 4:
+            return x
+        else:
+            raise ValueError(f"Unsupported tensor rank {x.dim()} for shape {x.shape}")
+
+    def _find_boundary(self, sky_mask_binary, band_width):
+        mask4d = self._ensure_4d(sky_mask_binary)
+        dilated = F.max_pool2d(mask4d, kernel_size=band_width, stride=1, padding=band_width // 2)
+        eroded = 1.0 - F.max_pool2d(1.0 - mask4d, kernel_size=band_width, stride=1, padding=band_width // 2)
+        N, C, H, W = mask4d.shape
+        dilated = dilated[..., :H, :W]
+        eroded = eroded[..., :H, :W]
+        boundary = (dilated - eroded) > 0.01
+        while boundary.dim() > 2:
+            boundary = boundary.squeeze(0)
+        return boundary.float()
+
+    def _detect_far_depth_regions(self, depth, percentile_threshold):
+        depth_flat = depth.flatten()
+        threshold_value = torch.quantile(depth_flat, percentile_threshold)
+        far_mask = (depth >= threshold_value).float()
+        if far_mask.sum() > 0:
+            far_mask_4d = far_mask.unsqueeze(0).unsqueeze(0) if far_mask.dim() == 2 else far_mask
+            if far_mask_4d.dim() == 3:
+                far_mask_4d = far_mask_4d.unsqueeze(0)
+            kernel_size = 5
+            far_mask_dilated = F.max_pool2d(far_mask_4d, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            far_mask_closed = 1.0 - F.max_pool2d(1.0 - far_mask_dilated, kernel_size=kernel_size, stride=1, padding=kernel_size // 2)
+            far_mask = far_mask_closed.squeeze()
+        return far_mask, threshold_value
+
+    def _create_soft_alpha_blend(self, blend_zone, fade_band_width, device, dtype):
+        blend_indices = blend_zone.cpu().numpy().astype(float)
+        dist_to_nonsky = distance_transform_edt(1 - blend_indices)
+        dist_norm = dist_to_nonsky / (fade_band_width + 1)
+        dist_norm = np.clip(dist_norm, 0, 1)
+        # Cosine easing for smooth alpha ramp
+        alpha_band = 0.5 * (1 + np.cos(np.pi * dist_norm))
+        blend_map = torch.from_numpy(alpha_band).to(device, dtype=dtype)
+        return blend_map
+
+    def process(self, da3_model, images, camera_params=None, resize_method="resize", keep_model_size=False,
+                contrast_boost=2.0, sky_threshold=0.25, fade_band_width=4,
+                enable_far_depth_detection=True, far_depth_percentile=0.98):
+
+        # Clamp inputs for safety
+        sky_threshold = max(0.15, min(0.4, sky_threshold))
+        fade_band_width = int(max(2, min(8, fade_band_width)))
+
+        device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
+        model = da3_model['model']
+        dtype = da3_model['dtype']
+        config = da3_model['config']
+        capabilities = check_model_capabilities(model)
+        B, H, W, C = images.shape
+        images_pt = images.permute(0, 3, 1, 2)
+        images_pt, orig_H, orig_W = resize_to_patch_multiple(images_pt, DEFAULT_PATCH_SIZE, resize_method)
+        normalize = transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD)
+        normalized_images = normalize(images_pt)
+        normalized_images = normalized_images.unsqueeze(1)
+        extrinsics_input = None
+        intrinsics_input = None
+        if camera_params is not None and capabilities.get("has_camera_conditioning", False):
+            extrinsics_input = camera_params["extrinsics"].to(device).to(dtype)
+            intrinsics_input = camera_params["intrinsics"].to(device).to(dtype)
+            if extrinsics_input.shape[0] == 1 and B > 1:
+                extrinsics_input = extrinsics_input.expand(B, -1, -1, -1)
+                intrinsics_input = intrinsics_input.expand(B, -1, -1, -1)
+        pbar = ProgressBar(B)
+        depth_out, conf_out, sky_out = [], [], []
+        safe_model_to_device(model, device)
+        autocast_condition = (dtype != torch.float32) and not mm.is_device_mps(device)
+        with torch.autocast(mm.get_autocast_device(device), dtype=dtype) if autocast_condition else nullcontext():
+            for i in range(B):
+                img = normalized_images[i:i + 1].to(device)
+                ext_i = extrinsics_input[i:i + 1] if extrinsics_input is not None else None
+                int_i = intrinsics_input[i:i + 1] if intrinsics_input is not None else None
+                output = model(img, extrinsics=ext_i, intrinsics=int_i)
+                depth = getattr(output, 'depth', output.get('depth')) if isinstance(output, dict) or hasattr(output, 'depth') else None
+                conf = getattr(output, 'depth_conf', output.get('depth_conf')) if isinstance(output, dict) or hasattr(output, 'depth_conf') else None
+                if conf is None or not torch.is_tensor(conf): conf = torch.ones_like(depth)
+                sky = getattr(output, 'sky', output.get('sky')) if isinstance(output, dict) or hasattr(output, 'sky') else None
+                if sky is None or not torch.is_tensor(sky): sky = torch.zeros_like(depth)
+                else:
+                    sky_min, sky_max = sky.min(), sky.max()
+                    if sky_max > sky_min: sky = (sky - sky_min) / (sky_max - sky_min)
+                while depth.dim() > 2: depth = depth.squeeze(0)
+                while sky.dim() > 2: sky = sky.squeeze(0)
+                sky_mask_binary = (sky > sky_threshold).float()
+                if enable_far_depth_detection:
+                    far_depth_mask, depth_threshold = self._detect_far_depth_regions(depth, far_depth_percentile)
+                    while sky_mask_binary.dim() < far_depth_mask.dim():
+                        sky_mask_binary = sky_mask_binary.unsqueeze(0)
+                    while far_depth_mask.dim() < sky_mask_binary.dim():
+                        far_depth_mask = far_depth_mask.unsqueeze(0)
+                    combined_sky_mask = torch.maximum(sky_mask_binary, far_depth_mask)
+                    content_mask_binary = 1.0 - combined_sky_mask
+                else:
+                    combined_sky_mask = sky_mask_binary
+                    content_mask_binary = 1.0 - sky_mask_binary
+                boundary = self._find_boundary(combined_sky_mask, fade_band_width)
+                sky_depths = depth[content_mask_binary < 0.5]
+                if sky_depths.numel() > 10:
+                    sky_depth_mean = sky_depths.mean()
+                    sky_depth_std = sky_depths.std()
+                else:
+                    sky_depth_mean, sky_depth_std = depth.mean(), depth.std()
+                far_background = ((depth >= (sky_depth_mean - sky_depth_std)) & (depth <= (sky_depth_mean + sky_depth_std)))
+                blend_zone = (boundary > 0) & (far_background > 0)
+                blend_map = torch.zeros_like(depth)
+                if blend_zone.any():
+                    blend_map = self._create_soft_alpha_blend(blend_zone, fade_band_width, depth.device, depth.dtype)
+                mask = content_mask_binary.float()
+                mask[blend_zone] = blend_map[blend_zone]
+                disparity = 1.0 / (depth + 1e-6)
+                content_pixels = disparity[mask > 0.99]
+                if content_pixels.numel() > 100:
+                    if content_pixels.numel() > 1000:
+                        sorted_pixels = torch.sort(content_pixels.flatten())[0]
+                        p1 = max(1, int(sorted_pixels.numel() * 0.01))
+                        p99 = min(sorted_pixels.numel() - 1, int(sorted_pixels.numel() * 0.99))
+                        disp_min, disp_max = sorted_pixels[p1], sorted_pixels[p99]
+                    else:
+                        disp_min, disp_max = content_pixels.min(), content_pixels.max()
+                    disparity_norm = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+                    disparity_norm = torch.clamp(disparity_norm, 0.0, 1.0)
+                else:
+                    disp_min, disp_max = disparity.min(), disparity.max()
+                    disparity_norm = (disparity - disp_min) / (disp_max - disp_min + 1e-6)
+                disparity_contrast = torch.pow(disparity_norm, 1.0 / contrast_boost)
+                depth_final = disparity_contrast * mask
+                conf_range = conf.max() - conf.min()
+                conf = (conf - conf.min()) / conf_range if conf_range > 1e-8 else torch.ones_like(conf)
+                depth_out.append(depth_final.cpu())
+                conf_out.append(conf.cpu())
+                while sky.dim() > 3:
+                    sky = sky.squeeze(0)
+                if sky.dim() == 2:
+                    sky = sky.unsqueeze(0)
+                sky_out.append(sky.cpu())
+                pbar.update(1)
+        model.to(offload_device)
+        mm.soft_empty_cache()
+        depth_final = process_tensor_to_image(depth_out, orig_H, orig_W, normalize_output=False, skip_resize=keep_model_size)
+        conf_final = process_tensor_to_image(conf_out, orig_H, orig_W, normalize_output=True, skip_resize=keep_model_size)
+        sky_final = process_tensor_to_mask(sky_out, orig_H, orig_W, skip_resize=keep_model_size)
+        return (depth_final, conf_final, sky_final)
+
+
+
+
+
 NODE_CLASS_MAPPINGS = {
     "DepthAnything_V3": DepthAnything_V3,
     "DepthAnythingV3_3D": DepthAnythingV3_3D,
     "DepthAnythingV3_Advanced": DepthAnythingV3_Advanced,
     "DepthAnythingTBGV3_V2Style": DepthAnythingTBGV3_V2Style,  # by TBG
+    "DepthAnythingV3_V2Style_Pure": DepthAnythingV3_V2Style_Pure, # by TBG
+    "DepthAnythingV3_V2Style_AdaptiveHorizon": DepthAnythingV3_V2Style_AdaptiveHorizon, # by TBG
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -890,4 +1326,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "DepthAnythingV3_3D": "Depth Anything V3 (3D/Raw)",
     "DepthAnythingV3_Advanced": "Depth Anything V3 (Advanced)",
     "DepthAnythingTBGV3_V2Style": "Depth Anything V3 (TBG V2 Style)",   # by TBG
+    "DepthAnythingV3_V2Style_Pure": "Depth Anything V3 (TBG V2 Style) Pure",   # by TBG
+    "DepthAnythingV3_V2Style_AdaptiveHorizon": "Depth Anything V3 (TBG V2 Style) AdaptiveHorizon",  # by TBG
 }
